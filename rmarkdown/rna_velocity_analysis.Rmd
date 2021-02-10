@@ -1,0 +1,192 @@
+---
+title: "RNA velocity analysis"
+description: "RNA velocity analysis of the HermannSpermatogenesisData dataset using velociraptor/scVelo"
+author: "Michał Kabza"
+date: "`r Sys.Date()`"
+output:
+  distill::distill_article:
+    toc: true
+    toc_depth: 1
+---
+
+```{r, include = FALSE}
+library(BiocStyle)
+```
+
+# Preparing the environment
+
+```{r, message = FALSE}
+# Load the required packages
+library(dplyr)
+library(forcats)
+library(tibble)
+library(glue)
+library(ggplot2)
+library(Matrix)
+library(SummarizedExperiment)
+library(SingleCellExperiment)
+library(scRNAseq)
+library(scuttle)
+library(scater)
+library(scran)
+library(igraph)
+library(velociraptor)
+library(BiocParallel)
+
+# Check the default back-end for parallel evaluation
+bpparam()
+```
+
+# Preparing the data
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Load the Hermann et al. (2018) mouse spermatogenic cells dataset
+sce <- HermannSpermatogenesisData()
+sce
+# UMI count per cell statistics (spliced)
+summary(colSums(assay(sce, "spliced")))
+# Expressed genes per cell statistics (spliced)
+summary(colSums(assay(sce, "spliced") > 0))
+# UMI count per cell statistics (unspliced)
+summary(colSums(assay(sce, "unspliced")))
+# Expressed genes per cell statistics (unspliced)
+summary(colSums(assay(sce, "unspliced") > 0))
+# Cell type summary
+colData(sce) %>%
+	as.data.frame() %>%
+	ggplot(mapping = aes(x = fct_rev(fct_infreq(celltype)))) +
+	geom_bar() +
+	labs(
+		title = "Cell type summary",
+		x = "Cell type",
+		y = "Cell count"
+	) +
+	coord_flip() +
+	theme_bw()
+colData(sce)$celltype %>%
+	table(useNA = "ifany") %>%
+	enframe() %>%
+	arrange(desc(value))
+# Remove cell types with fewer than 100 cells
+cell_types_to_keep <- colData(sce)$celltype %>%
+	table(useNA = "ifany") %>%
+	enframe() %>%
+	filter(value >= 100) %>%
+	pull(name)
+sce <- sce[, colData(sce)$celltype %in% cell_types_to_keep]
+# Correct cell type names
+sce$celltype[is.na(sce$celltype)] <- "Unknown"
+sce$celltype[sce$celltype == "DIplotene/Secondary spermatocytes"] <- "Secondary spermatocytes"
+sce
+```
+
+# Processing the data
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Normalize the data
+quick_clusters <- quickCluster(sce, assay.type = "spliced")
+sce <- computeSumFactors(sce, clusters = quick_clusters, assay.type = "spliced")
+sce <- logNormCounts(sce, assay.type = "spliced")
+# Select HVGs
+dec <- modelGeneVar(sce)
+top_hvgs <- getTopHVGs(dec, fdr.threshold = 0.05)
+length(top_hvgs)
+# Run the PCA
+sce <- denoisePCA(sce, dec, subset.row = top_hvgs)
+ncol(reducedDim(sce, "PCA"))
+# Run UMAP
+sce <- runUMAP(sce, dimred = "PCA")
+plotUMAP(sce, colour_by = "celltype", text_by = "celltype", text_size = 3) +
+	theme(legend.position = "none")
+```
+
+# RNA velocity analysis
+
+**Steady-state approach (default)**
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run scVelo
+sce_velo <- scvelo(sce,
+                   mode = "steady_state",
+                   assay.X="spliced",
+                   assay.spliced = "spliced",
+                   assay.unspliced = "unspliced",
+                   subset.row = top_hvgs,
+                   use.dimred = "PCA")
+sce_velo
+# Plot the velocity vectors
+sce$pseudotime <- sce_velo$velocity_pseudotime
+embedded <- embedVelocity(reducedDim(sce, "UMAP"), sce_velo)
+grid_df <- gridVectors(reducedDim(sce, "UMAP"), embedded, resolution = 30)
+plotUMAP(sce, colour_by = "pseudotime", point_alpha = 0.3) +
+	geom_segment(
+		data = grid_df, 
+		mapping = aes(x = start.1, y = start.2, xend = end.1, yend = end.2),
+		arrow = arrow(length = unit(0.05, "inches"), type="closed")
+	)
+```
+
+scVelo producing an inverted direction of pseudotime is a [known issue](https://github.com/theislab/scvelo/issues/112).
+
+**Dynamical approach**
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run scVelo
+sce_velo <- scvelo(sce,
+                   mode = "dynamical",
+                   assay.X="spliced",
+                   assay.spliced = "spliced",
+                   assay.unspliced = "unspliced",
+                   subset.row = top_hvgs,
+                   use.dimred = "PCA")
+sce_velo
+# Plot the velocity vectors
+sce$pseudotime <- sce_velo$velocity_pseudotime
+embedded <- embedVelocity(reducedDim(sce, "UMAP"), sce_velo)
+grid_df <- gridVectors(reducedDim(sce, "UMAP"), embedded, resolution = 30)
+plotUMAP(sce, colour_by = "pseudotime", point_alpha = 0.3) +
+	geom_segment(
+		data = grid_df, 
+		mapping = aes(x = start.1, y = start.2, xend = end.1, yend = end.2),
+		arrow = arrow(length = unit(0.05, "inches"), type="closed")
+	)
+```
+
+**Stochastic approach**
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run scVelo
+sce_velo <- scvelo(sce,
+                   mode = "stochastic",
+                   assay.X="spliced",
+                   assay.spliced = "spliced",
+                   assay.unspliced = "unspliced",
+                   subset.row = top_hvgs,
+                   use.dimred = "PCA")
+sce_velo
+# Plot the velocity vectors
+sce$pseudotime <- sce_velo$velocity_pseudotime
+embedded <- embedVelocity(reducedDim(sce, "UMAP"), sce_velo)
+grid_df <- gridVectors(reducedDim(sce, "UMAP"), embedded, resolution = 30)
+plotUMAP(sce, colour_by = "pseudotime", point_alpha = 0.3) +
+	geom_segment(
+		data = grid_df, 
+		mapping = aes(x = start.1, y = start.2, xend = end.1, yend = end.2),
+		arrow = arrow(length = unit(0.05, "inches"), type="closed")
+	)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
