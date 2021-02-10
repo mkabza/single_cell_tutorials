@@ -1,0 +1,321 @@
+---
+title: "Standard scran workflow"
+description: "Analysis of the BaronPancreasData dataset using standard scran workflow"
+author: "Michał Kabza"
+date: "`r Sys.Date()`"
+output:
+  distill::distill_article:
+    toc: true
+    toc_depth: 1
+---
+
+```{r, include = FALSE}
+library(BiocStyle)
+```
+
+# Preparing the environment
+
+```{r, message = FALSE}
+# Load the required packages
+library(dplyr)
+library(forcats)
+library(tibble)
+library(glue)
+library(ggplot2)
+library(pheatmap)
+library(viridis)
+library(clustree)
+library(Matrix)
+library(PCAtools)
+library(SummarizedExperiment)
+library(SingleCellExperiment)
+library(scRNAseq)
+library(scuttle)
+library(bluster)
+library(scater)
+library(scran)
+library(igraph)
+library(BiocParallel)
+
+# Check the default back-end for parallel evaluation
+bpparam()
+```
+
+# Preparing the data
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Load the Baron et al. (2016) human pancreas dataset
+sce <- BaronPancreasData('human')
+sce
+# UMI count per cell statistics
+summary(colSums(counts(sce)))
+# Expressed genes per cell statistics
+summary(colSums(counts(sce) > 0))
+# Cell type summary
+colData(sce) %>%
+	as.data.frame() %>%
+	ggplot(mapping = aes(x = fct_rev(fct_infreq(label)))) +
+	geom_bar() +
+	labs(
+		title = "Cell type summary",
+		x = "Cell type",
+		y = "Cell count"
+	) +
+	coord_flip() +
+	theme_bw()
+colData(sce)$label %>%
+	table() %>%
+	enframe() %>%
+	arrange(desc(value))
+# Remove cell types with fewer than 100 cells
+cell_types_to_keep <- colData(sce)$label %>%
+	table() %>%
+	enframe() %>%
+	filter(value >= 100) %>%
+	pull(name)
+sce <- sce[, colData(sce)$label %in% cell_types_to_keep]
+sce
+```
+
+# Normalizing data
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Calculate per-cell size factors from the library sizes (i.e. total sum of counts per cell)
+sce <- computeLibraryFactors(sce)
+summary(sizeFactors(sce))
+# scran offers a more advanced deconvolution strategy for size factor calculation
+quick_clusters <- quickCluster(sce)
+table(quick_clusters)
+sce <- computeSumFactors(sce, clusters = quick_clusters)
+summary(sizeFactors(sce))
+# Calculate log-transformed normalized counts
+sce <- logNormCounts(sce)
+sce
+```
+
+# Selecting highly variable genes
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Model gene variance
+dec <- modelGeneVar(sce)
+dec
+dec %>%
+	as.data.frame() %>%
+	ggplot(mapping = aes(x = mean, y = total)) +
+	geom_point() +
+	geom_smooth() +
+	labs(
+		title = "Modelling gene variance",
+		x = "Mean log-expression",
+		y = "Total variance"
+	) +
+	theme_bw()
+# Select the top 2000 variable genes
+top_hvgs <- getTopHVGs(dec, n = 2000)
+length(top_hvgs)
+# Select the top 10% of variable genes
+top_hvgs <- getTopHVGs(dec, prop = 0.1)
+length(top_hvgs)
+length(top_hvgs) / nrow(dec)
+# Overall number of variable genes
+length(getTopHVGs(dec, prop = 1))
+# Select all variable genes with FDR below 5%
+top_hvgs <- getTopHVGs(dec, fdr.threshold = 0.05)
+length(top_hvgs)
+```
+
+# Principal component analysis
+
+**Option 1**
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run the PCA
+sce <- runPCA(sce, ncomponents = 50, subset_row = top_hvgs)
+sce
+ncol(reducedDim(sce, "PCA"))
+# Use scree plot to choose the number of PCs
+percent_var <- attr(reducedDim(sce, "PCA"), "percentVar")
+pca_elbow <- findElbowPoint(percent_var)
+pca_elbow
+ggplot(mapping = aes(x = seq_along(percent_var), y = percent_var)) +
+geom_point() +
+geom_vline(xintercept = pca_elbow, col = "blue") +
+labs(
+	title = "Scree plot",
+	x = "PC",
+	y = "Variance explained (%)"
+) +
+theme_bw()
+# Keep only selected PCs
+reducedDim(sce, "PCA") <- reducedDim(sce, "PCA")[, 1:pca_elbow, drop = FALSE]
+```
+
+**Option 2**
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run the PCA
+sce <- runPCA(sce, ncomponents = 50, subset_row = top_hvgs)
+ncol(reducedDim(sce, "PCA"))
+# Use clusters to choose the number of PCs
+pca_stats <- getClusteredPCs(reducedDim(sce, "PCA"), k = 10)
+npcs <- metadata(pca_stats)$chosen
+npcs
+pca_stats %>%
+	as.data.frame() %>%
+	ggplot(mapping = aes(x = n.pcs, y = n.clusters)) +
+	geom_point() +
+	labs(
+		title = "getClusteredPCs results",
+		x = "Number of PCs",
+		y = "Number of clusters"
+	) +
+	theme_bw()
+# Keep only selected PCs
+reducedDim(sce, "PCA") <- reducedDim(sce, "PCA")[, 1:npcs, drop = FALSE]
+```
+
+**Option 3**
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run the PCA and remove principal components corresponding to technical noise
+sce <- denoisePCA(sce, dec, subset.row = top_hvgs, min.rank = 5, max.rank = 50)
+ncol(reducedDim(sce, "PCA"))
+```
+
+# Dimensionality reduction
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run UMAP
+sce <- runUMAP(sce, dimred = "PCA")
+plotUMAP(sce, colour_by = "label", text_by = "label", text_size = 3) +
+	theme(legend.position = "none")
+```
+
+# Cell clustering
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Build the nearest-neighbor graph
+snn_graph <- buildSNNGraph(sce, use.dimred = "PCA", k = 10)
+```
+
+**Detect clusters using short random walks (Walktrap clustering)**
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+set.seed(42)
+colData(sce)$cluster_walktrap <- cluster_walktrap(snn_graph)$membership
+table(colData(sce)$cluster_walktrap)
+plotUMAP(sce, colour_by = "cluster_walktrap", text_by = "cluster_walktrap", text_size = 3) +
+	theme(legend.position = "none")
+cluster_table <- table(fct_infreq(colData(sce)$label),
+                       colData(sce)$cluster_walktrap)
+pheatmap(log10(cluster_table + 10),
+         main = "Cell type vs Walktrap clusters",
+         color = viridis(100),
+         cluster_rows = FALSE, cluster_cols = TRUE,
+         treeheight_row = 0, treeheight_col = 0)
+cluster_modularity <- pairwiseModularity(snn_graph, colData(sce)$cluster_walktrap, as.ratio = TRUE)
+pheatmap(log10(cluster_modularity + 1),
+         main = "Walktrap cluster modularity",
+         color = viridis(100),
+         cluster_rows = FALSE, cluster_cols = FALSE)
+```
+
+**Detect clusters using multi-level optimization of modularity (Louvain clustering)**
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+set.seed(42)
+colData(sce)$cluster_louvain <- cluster_louvain(snn_graph)$membership
+table(colData(sce)$cluster_louvain)
+plotUMAP(sce, colour_by = "cluster_louvain", text_by = "cluster_louvain", text_size = 3) +
+	theme(legend.position = "none")
+cluster_table <- table(fct_infreq(colData(sce)$label),
+                       colData(sce)$cluster_louvain)
+pheatmap(log10(cluster_table + 10),
+         main = "Cell type vs Louvain clusters",
+         color = viridis(100),
+         cluster_rows = FALSE, cluster_cols = TRUE,
+         treeheight_row = 0, treeheight_col = 0)
+cluster_modularity <- pairwiseModularity(snn_graph, colData(sce)$cluster_louvain, as.ratio = TRUE)
+pheatmap(log10(cluster_modularity + 1),
+         main = "Louvain cluster modularity",
+         color = viridis(100),
+         cluster_rows = FALSE, cluster_cols = FALSE)
+```
+
+**Using different values of k**
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+set.seed(42)
+for (k in c(5, 10, 20, 50, 100)) {
+	snn_graph <- buildSNNGraph(sce, use.dimred = "PCA", k = k)
+	colData(sce)[glue("k{k}")] <- cluster_louvain(snn_graph)$membership
+}
+clustree(sce, prefix = "k") +
+	guides(edge_alpha = FALSE, edge_colour = FALSE)
+plotUMAP(sce, colour_by = "k100", text_by = "k100", text_size = 3) +
+	theme(legend.position = "none") +
+	labs(title = "Louvain clustering (k = 100)")
+```
+
+# Marker gene detection
+
+**Detecting marker genes using t-test**
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+markers <- findMarkers(sce, groups = sce$label, test.type = "t",
+                       pval.type = "all", direction = "up", lfc = 1)
+markers
+head(markers[["alpha"]])
+# Get top marker for each cell type
+top_markers <- lapply(markers, function(x) {rownames(x)[1]}) %>%
+	unlist() %>%
+	enframe()
+top_markers
+# Top marker expression heatmap 
+plotGroupedHeatmap(sce, features = top_markers$value, group = "label",
+                   color = viridis(100), cluster_rows = FALSE, cluster_cols = FALSE)
+# Show marker gene expression on a UMAP plot
+plotUMAP(sce, colour_by = "GCG")
+plotUMAP(sce, colour_by = "INS")
+```
+
+**Detecting marker genes using Wilcoxon rank sum test**
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+
+markers <- findMarkers(sce, groups = sce$label, test.type = "wilcox",
+                       pval.type = "all", direction = "up")
+head(markers[["alpha"]])
+# Get top marker for each cell type
+top_markers <- lapply(markers, function(x) {rownames(x)[1]}) %>%
+	unlist() %>%
+	enframe()
+top_markers
+```
+
+**Detecting marker genes using binomial test**
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE, dpi = 200}
+markers <- findMarkers(sce, groups = sce$label, test.type = "binom",
+                       pval.type = "all", direction = "up")
+head(markers[["alpha"]])
+# Get top marker for each cell type
+top_markers <- lapply(markers, function(x) {rownames(x)[1]}) %>%
+	unlist() %>%
+	enframe()
+top_markers
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
