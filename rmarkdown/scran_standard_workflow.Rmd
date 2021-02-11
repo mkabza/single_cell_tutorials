@@ -35,10 +35,6 @@ library(bluster)
 library(scater)
 library(scran)
 library(igraph)
-library(BiocParallel)
-
-# Check the default back-end for parallel evaluation
-bpparam()
 ```
 
 # Preparing the data
