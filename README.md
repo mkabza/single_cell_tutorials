@@ -3,6 +3,7 @@
 ## Single cell data analysis in Bioconductor
 
   * Basic scRNA-Seq analysis: [human pancreas (Baron et al. 2016)](https://mkabza.github.io/single_cell_tutorials/reports/human_pancreas_baron_2016.html)
+  * Cell type annotation: [pbmc4k dataset (10X Genomics)](https://mkabza.github.io/single_cell_tutorials/reports/pbmc4k_10x_genomics.html)
 
 ## scRNA-Seq datasets
 
