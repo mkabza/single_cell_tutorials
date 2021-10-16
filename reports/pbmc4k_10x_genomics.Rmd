@@ -1,0 +1,239 @@
+---
+title: "Analysis of pbmc4k dataset (10X Genomics)"
+author: "Michał Kabza"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: default
+    highlight: pygments
+    df_print: kable
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+# Preparing the environment
+
+Load the required packages:
+```{r, message = FALSE}
+library(tidyverse)
+library(glue)
+library(Matrix)
+library(TENxPBMCData)
+library(scater)
+library(scran)
+library(SingleR)
+library(celldex)
+library(bluster)
+library(dittoSeq)
+library(Nebulosa)
+```
+
+# Preparing the data
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Load the pbmc4k peripheral blood mononuclear cell dataset
+sce <- TENxPBMCData(dataset = "pbmc4k")
+sce
+# Cell metadata
+head(colData(sce))
+# Gene metadata
+rowData(sce)
+# Add column names to the SingleCellExperiment object
+colnames(sce) <- sce$Barcode
+rownames(colData(sce)) <- colnames(sce)
+# Change row names to unique gene symbols
+rownames(sce) <- uniquifyFeatureNames(rowData(sce)$ENSEMBL_ID, rowData(sce)$Symbol_TENx)
+sce
+```
+
+# Basic analysis
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Data normalization
+quick_clusters <- quickCluster(sce)
+table(quick_clusters)
+sce <- computeSumFactors(sce, clusters = quick_clusters)
+sce <- logNormCounts(sce)
+# Selecting highly variable genes
+dec <- modelGeneVar(sce)
+top_hvgs <- getTopHVGs(dec, fdr.threshold = 0.05)
+length(top_hvgs)
+# Principal component analysis
+sce <- denoisePCA(sce, dec, subset.row = top_hvgs, min.rank = 5, max.rank = 50)
+ncol(reducedDim(sce, "PCA"))
+# Dimensionality reduction by UMAP
+sce <- runUMAP(sce, dimred = "PCA")
+```
+
+# Cell type annotation
+
+**Note**: Information about all available reference datasets can be found in the `r BiocStyle::Biocpkg("celldex")` package documentation
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Prepare the reference dataset
+ref_se <- BlueprintEncodeData()
+ref_se
+# Annotate cell types using SingleR (main labels)
+singler_results <- SingleR(sce, ref_se, labels = ref_se$label.main)
+head(singler_results)
+```
+
+```{r, message = FALSE, warning = FALSE}
+# SingleR predictions summary
+table(singler_results$labels)
+table(singler_results$pruned.labels)
+sum(is.na(singler_results$pruned.labels))
+# SingleR score heatmap
+plotScoreHeatmap(singler_results)
+# Add cell type information to the SingleCellExperiment object
+sce$cell_type_blueprint_main <- singler_results$pruned.labels %>%
+	fct_explicit_na(na_level = "Other") %>%
+	fct_lump_min(min = 100, other_level = "Other") %>%
+	fct_relevel("Other", after = Inf) %>%
+	fct_drop()
+# UMAP plots
+dittoDimPlot(sce, "cell_type_blueprint_main", reduction.use = "UMAP", size = 0.5)
+dittoDimPlot(sce, "cell_type_blueprint_main", reduction.use = "UMAP", size = 0.1,
+             split.by = "cell_type_blueprint_main", split.ncol = 3)
+```
+
+# Cell clustering
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Detect cell clusters using a graph-based approach
+colLabels(sce) <- clusterRows(reducedDim(sce, "PCA"),
+                              NNGraphParam(k = 100, cluster.fun = "louvain"))
+table(sce$label)
+```
+
+```{r, message = FALSE, warning = FALSE}
+# UMAP plot
+dittoDimPlot(sce, "label", reduction.use = "UMAP", size = 0.5)
+# Cluster vs cell type barplots
+dittoBarPlot(sce, "cell_type_blueprint_main", group.by = "label",
+             scale = "percent")
+dittoBarPlot(sce, "cell_type_blueprint_main", group.by = "label",
+             scale = "count")
+```
+
+# Fine-grained cell type annotation
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Annotate cell types using SingleR (fine labels)
+sce$cell_type_blueprint_fine <- SingleR(sce, ref_se, labels = ref_se$label.fine)$pruned.labels
+table(sce$cell_type_blueprint_fine)
+```
+
+```{r, message = FALSE, warning = FALSE}
+# Add cell type information to the SingleCellExperiment object
+sce$cell_type_blueprint_fine <- sce$cell_type_blueprint_fine %>%
+	fct_explicit_na(na_level = "Other") %>%
+	fct_lump_min(min = 100, other_level = "Other") %>%
+	fct_relevel("Other", after = Inf) %>%
+	fct_drop()
+# SingleR predictions summary
+table(sce$cell_type_blueprint_fine)
+# UMAP plot
+dittoDimPlot(sce, "cell_type_blueprint_fine", reduction.use = "UMAP", size = 0.5)
+# Cluster vs cell type barplots
+dittoBarPlot(sce, "cell_type_blueprint_fine", group.by = "label",
+             scale = "percent")
+dittoBarPlot(sce[, colLabels(sce) %in% c(1, 4)],
+             "cell_type_blueprint_fine", group.by = "label",
+             scale = "percent")
+```
+
+# Using known marker genes
+
+## Comparing monocyte clusters {.tabset}
+
+```{r, message = FALSE, warning = FALSE}
+# Identify marker genes differentiating the monocyte clusters
+markers_monocyte <- findMarkers(sce, groups = sce$label, test.type = "wilcox",
+                                pval.type = "any", direction = "up",
+                                restrict = c(3, 5))
+```
+
+### Cluster 3 markers
+
+```{r, message = FALSE, warning = FALSE}
+head(as.data.frame(markers_monocyte[["3"]]), n = 10)
+```
+
+### Cluster 5 markers
+
+```{r, message = FALSE, warning = FALSE}
+head(as.data.frame(markers_monocyte[["5"]]), n = 10)
+```
+
+### CD14+ vs CD16+ monocytes scatter plot
+
+```{r, message = FALSE, warning = FALSE}
+dittoScatterPlot(sce[, colLabels(sce) %in% c(3, 5)],
+                 x.var = "CD14", y.var = "FCGR3A", color.var = "label")
+```
+
+### CD14+ vs CD16+ monocytes hex scatter plot
+
+```{r, message = FALSE, warning = FALSE}
+dittoScatterHex(sce[, colLabels(sce) %in% c(3, 5)],
+                x.var = "CD14", y.var = "FCGR3A",
+                color.var = "label", max.density = 10)
+```
+
+## Comparing CD4+ T cell subpopulations {.tabset}
+
+```{r, message = FALSE, warning = FALSE}
+# Identify marker genes differentiating the CD4+ T cell subpopulations
+sce$cell_type_cluster <- paste(sce$cell_type_blueprint_main, sce$label, sep = ".")
+markers_cd4 <- findMarkers(sce, groups = sce$cell_type_cluster, test.type = "wilcox",
+                           pval.type = "any", direction = "up",
+                           restrict = c("CD4+ T-cells.1", "CD4+ T-cells.4"))
+```
+
+### Cluster 1 markers
+
+```{r, message = FALSE, warning = FALSE}
+head(as.data.frame(markers_cd4[["CD4+ T-cells.1"]]), n = 10)
+```
+
+### Cluster 4 markers
+
+```{r, message = FALSE, warning = FALSE}
+head(as.data.frame(markers_cd4[["CD4+ T-cells.4"]]), n = 10)
+```
+
+### Memory CD4+ T cell markers density plot
+
+```{r, message = FALSE, warning = FALSE}
+density_plots <- plot_density(sce, c("CD4", "IL7R", "S100A4"), size = 0.5,
+                              joint = TRUE, combine = FALSE)
+density_plots[[length(density_plots)]]
+```
+
+### Activated CD4+ T cell markers density plot
+
+```{r, message = FALSE, warning = FALSE}
+density_plots <- plot_density(sce, c("CD4", "IL7R", "CD69"), size = 0.5,
+                              joint = TRUE, combine = FALSE)
+density_plots[[length(density_plots)]]
+```
+
+### Naive CD4+ T cell markers density plot
+
+```{r, message = FALSE, warning = FALSE}
+density_plots <- plot_density(sce, c("CD4", "IL7R", "CCR7"), size = 0.5,
+                              joint = TRUE, combine = FALSE)
+density_plots[[length(density_plots)]]
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
