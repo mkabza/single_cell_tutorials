@@ -1,0 +1,337 @@
+---
+title: "Analysis of mouse spermatogenic cells data (Hermann et al. 2018)"
+author: "Michał Kabza"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: default
+    highlight: pygments
+    df_print: kable
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+# Preparing the environment
+
+Load the required packages:
+```{r, message = FALSE}
+library(tidyverse)
+library(glue)
+library(knitr)
+library(Matrix)
+library(scRNAseq)
+library(scater)
+library(scran)
+library(velociraptor)
+library(dittoSeq)
+library(viridis)
+```
+
+# Preparing the data
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Load the Hermann et al. (2018) mouse spermatogenic cells dataset
+sce <- HermannSpermatogenesisData()
+sce
+# Cell metadata
+colData(sce)
+# Cell type summary
+sce$celltype %>%
+	table(useNA = "ifany") %>%
+	enframe() %>%
+	arrange(desc(value))
+# Prepare the cell type labels
+sce$cell_type <- sce$celltype %>%
+  fct_explicit_na(na_level = "Other") %>%
+	fct_lump_min(min = 400, other_level = "Other") %>%
+	fct_relevel("Early Round spermatids", "Mid Round spermatids",
+	            "Late Round spermatids", "Other") %>%
+	fct_drop()
+table(sce$cell_type)
+```
+
+# Basic analysis
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Data normalization
+quick_clusters <- quickCluster(sce, assay.type = "spliced")
+table(quick_clusters)
+sce <- computeSumFactors(sce, clusters = quick_clusters, assay.type = "spliced")
+sce <- logNormCounts(sce, assay.type = "spliced")
+# Selecting highly variable genes
+dec <- modelGeneVar(sce)
+top_hvgs <- getTopHVGs(dec, fdr.threshold = 0.05)
+length(top_hvgs)
+# Principal component analysis
+sce <- denoisePCA(sce, dec, subset.row = top_hvgs, min.rank = 5, max.rank = 50)
+ncol(reducedDim(sce, "PCA"))
+# Dimensionality reduction by UMAP
+sce <- runUMAP(sce, dimred = "PCA")
+```
+
+# UMAP plots
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "cell_type", reduction.use = "UMAP", size = 0.5,
+             legend.show = FALSE, do.label = TRUE,
+             labels.highlight = FALSE, labels.size = 4)
+dittoDimPlot(sce, "cell_type", reduction.use = "UMAP", size = 0.1,
+             split.by = "cell_type", split.ncol = 2, legend.show = FALSE)
+```
+
+# RNA velocity analysis
+
+## Steady-state mode {.tabset}
+
+### scVelo
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run scVelo
+sce_velo_steady_state <- scvelo(sce,
+                                mode = "steady_state",
+                                assay.X = "spliced",
+                                assay.spliced = "spliced",
+                                assay.unspliced = "unspliced",
+                                subset.row = top_hvgs,
+                                use.dimred = "PCA")
+sce_velo_steady_state
+# Add RNA velocity information to the SingleCellExperiment object
+sce$velocity_pseudotime_steady_state <- sce_velo_steady_state$velocity_pseudotime
+sce$velocity_length_steady_state <- sce_velo_steady_state$velocity_length
+sce$velocity_confidence_steady_state <- sce_velo_steady_state$velocity_confidence
+# Project velocity vectors to the UMAP coordinates
+embedded_steady_state <- embedVelocity(reducedDim(sce, "UMAP"),
+                                       sce_velo_steady_state)
+grid_df_steady_state <- gridVectors(reducedDim(sce, "UMAP"),
+                                    embedded_steady_state, resolution = 30)
+```
+
+### RNA velocity vectors & pseudotime
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_pseudotime_steady_state",
+             reduction.use = "UMAP", size = 0.5) +
+	geom_segment(
+		data = grid_df_steady_state,
+		mapping = aes(x = start.1, y = start.2, xend = end.1, yend = end.2),
+		arrow = arrow(length = unit(0.05, "inches"), type = "open")
+	)
+```
+
+### RNA velocity vectors
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_pseudotime_steady_state",
+             cells.use = rep(FALSE, ncol(sce)),
+             reduction.use = "UMAP", size = 0.5) +
+	geom_segment(
+		data = grid_df_steady_state,
+		mapping = aes(x = start.1, y = start.2, xend = end.1, yend = end.2),
+		arrow = arrow(length = unit(0.05, "inches"), type = "open")
+	)
+```
+
+### RNA velocity pseudotime
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_pseudotime_steady_state",
+             reduction.use = "UMAP", size = 0.5)
+```
+
+### RNA velocity pseudotime by cell type
+
+```{r, message = FALSE, warning = FALSE}
+dittoPlot(sce, "velocity_pseudotime_steady_state", group.by = "cell_type",
+          x.reorder = rev(seq(length(levels(sce$cell_type)))),
+          plots = c("ridgeplot"), ridgeplot.lineweight = 0.5,
+          legend.show = FALSE)
+```
+
+### RNA velocity length
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_length_steady_state",
+             reduction.use = "UMAP", size = 0.5)
+```
+
+### RNA velocity confidence
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_confidence_steady_state",
+             reduction.use = "UMAP", size = 0.5)
+```
+
+## Stochastic mode {.tabset}
+
+### scVelo
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run scVelo
+sce_velo_stochastic <- scvelo(sce,
+                              mode = "stochastic",
+                              assay.X = "spliced",
+                              assay.spliced = "spliced",
+                              assay.unspliced = "unspliced",
+                              subset.row = top_hvgs,
+                              use.dimred = "PCA")
+sce_velo_stochastic
+# Add RNA velocity information to the SingleCellExperiment object
+sce$velocity_pseudotime_stochastic <- sce_velo_stochastic$velocity_pseudotime
+sce$velocity_length_stochastic <- sce_velo_stochastic$velocity_length
+sce$velocity_confidence_stochastic <- sce_velo_stochastic$velocity_confidence
+# Project velocity vectors to the UMAP coordinates
+embedded_stochastic <- embedVelocity(reducedDim(sce, "UMAP"),
+                                     sce_velo_stochastic)
+grid_df_stochastic <- gridVectors(reducedDim(sce, "UMAP"),
+                                  embedded_stochastic, resolution = 30)
+```
+
+### RNA velocity vectors & pseudotime
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_pseudotime_stochastic",
+             reduction.use = "UMAP", size = 0.5) +
+	geom_segment(
+		data = grid_df_stochastic,
+		mapping = aes(x = start.1, y = start.2, xend = end.1, yend = end.2),
+		arrow = arrow(length = unit(0.05, "inches"), type = "open")
+	)
+```
+
+### RNA velocity vectors
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_pseudotime_stochastic",
+             cells.use = rep(FALSE, ncol(sce)),
+             reduction.use = "UMAP", size = 0.5) +
+	geom_segment(
+		data = grid_df_stochastic,
+		mapping = aes(x = start.1, y = start.2, xend = end.1, yend = end.2),
+		arrow = arrow(length = unit(0.05, "inches"), type = "open")
+	)
+```
+
+### RNA velocity pseudotime
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_pseudotime_stochastic",
+             reduction.use = "UMAP", size = 0.5)
+```
+
+### RNA velocity pseudotime by cell type
+
+```{r, message = FALSE, warning = FALSE}
+dittoPlot(sce, "velocity_pseudotime_stochastic", group.by = "cell_type",
+          x.reorder = rev(seq(length(levels(sce$cell_type)))),
+          plots = c("ridgeplot"), ridgeplot.lineweight = 0.5,
+          legend.show = FALSE)
+```
+
+### RNA velocity length
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_length_stochastic",
+             reduction.use = "UMAP", size = 0.5)
+```
+
+### RNA velocity confidence
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_confidence_stochastic",
+             reduction.use = "UMAP", size = 0.5)
+```
+
+## Dynamical mode {.tabset}
+
+### scVelo
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run scVelo
+sce_velo_dynamical <- scvelo(sce,
+                             mode = "dynamical",
+                             assay.X = "spliced",
+                             assay.spliced = "spliced",
+                             assay.unspliced = "unspliced",
+                             subset.row = top_hvgs,
+                             use.dimred = "PCA")
+sce_velo_dynamical
+# Add RNA velocity information to the SingleCellExperiment object
+sce$velocity_pseudotime_dynamical <- sce_velo_dynamical$velocity_pseudotime
+sce$velocity_length_dynamical <- sce_velo_dynamical$velocity_length
+sce$velocity_confidence_dynamical <- sce_velo_dynamical$velocity_confidence
+# Project velocity vectors to the UMAP coordinates
+embedded_dynamical <- embedVelocity(reducedDim(sce, "UMAP"),
+                                    sce_velo_dynamical)
+grid_df_dynamical <- gridVectors(reducedDim(sce, "UMAP"),
+                                 embedded_dynamical, resolution = 30)
+```
+
+### RNA velocity vectors & pseudotime
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_pseudotime_dynamical",
+             reduction.use = "UMAP", size = 0.5) +
+	geom_segment(
+		data = grid_df_dynamical,
+		mapping = aes(x = start.1, y = start.2, xend = end.1, yend = end.2),
+		arrow = arrow(length = unit(0.05, "inches"), type = "open")
+	)
+```
+
+### RNA velocity vectors
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_pseudotime_dynamical",
+             cells.use = rep(FALSE, ncol(sce)),
+             reduction.use = "UMAP", size = 0.5) +
+	geom_segment(
+		data = grid_df_dynamical,
+		mapping = aes(x = start.1, y = start.2, xend = end.1, yend = end.2),
+		arrow = arrow(length = unit(0.05, "inches"), type = "open")
+	)
+```
+
+### RNA velocity pseudotime
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_pseudotime_dynamical",
+             reduction.use = "UMAP", size = 0.5)
+```
+
+### RNA velocity pseudotime by cell type
+
+```{r, message = FALSE, warning = FALSE}
+dittoPlot(sce, "velocity_pseudotime_dynamical", group.by = "cell_type",
+          x.reorder = rev(seq(length(levels(sce$cell_type)))),
+          plots = c("ridgeplot"), ridgeplot.lineweight = 0.5,
+          legend.show = FALSE)
+```
+
+### RNA velocity length
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_length_dynamical",
+             reduction.use = "UMAP", size = 0.5)
+```
+
+### RNA velocity confidence
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "velocity_confidence_dynamical",
+             reduction.use = "UMAP", size = 0.5)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
