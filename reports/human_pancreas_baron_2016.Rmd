@@ -1,0 +1,290 @@
+---
+title: "Analysis of human pancreas data (Baron et al. 2016)"
+author: "Michał Kabza"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: default
+    highlight: pygments
+    df_print: kable
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+# Preparing the environment
+
+Load the required packages:
+```{r, message = FALSE}
+library(tidyverse)
+library(glue)
+library(knitr)
+library(Matrix)
+library(scRNAseq)
+library(scater)
+library(scran)
+library(PCAtools)
+library(dittoSeq)
+library(Nebulosa)
+library(pheatmap)
+library(viridis)
+```
+
+# Preparing the data
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Load the Baron et al. (2016) human pancreas dataset
+sce <- BaronPancreasData('human')
+sce
+# Cell metadata
+colData(sce)
+# Cell type summary
+sce$label %>%
+	table() %>%
+	enframe() %>%
+	arrange(desc(value))
+# Remove cell types with fewer than 100 cells
+cell_types_to_keep <- sce$label %>%
+	table() %>%
+	enframe() %>%
+	filter(value >= 100) %>%
+	pull(name)
+sce <- sce[, sce$label %in% cell_types_to_keep]
+sce
+# Order cell types by freqency
+sce$label <- fct_infreq(sce$label)
+colData(sce)
+```
+
+# Data normalization
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Solution 1: library sizes (i.e. total sum of counts per cell)
+sce <- computeLibraryFactors(sce)
+summary(sizeFactors(sce))
+# Solution 2: deconvolution strategy implemented in scran
+quick_clusters <- quickCluster(sce)
+table(quick_clusters)
+sce <- computeSumFactors(sce, clusters = quick_clusters)
+summary(sizeFactors(sce))
+# Calculate log-transformed normalized counts
+sce <- logNormCounts(sce)
+sce
+```
+
+# Selecting highly variable genes
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Model gene variance
+dec <- modelGeneVar(sce)
+dec
+dec %>%
+	as.data.frame() %>%
+	ggplot(mapping = aes(x = mean, y = total)) +
+	geom_point() +
+	geom_smooth() +
+	labs(
+		title = "Modelling gene variance",
+		x = "Mean log-expression",
+		y = "Total variance"
+	) +
+	theme_bw()
+# Select the top 2000 variable genes
+top_hvgs <- getTopHVGs(dec, n = 2000)
+length(top_hvgs)
+# Select the top 10% of variable genes
+top_hvgs <- getTopHVGs(dec, prop = 0.1)
+length(top_hvgs)
+# Select all variable genes with FDR below 5%
+top_hvgs <- getTopHVGs(dec, fdr.threshold = 0.05)
+length(top_hvgs)
+```
+
+# Principal component analysis
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Solution 1: run the PCA and use scree plot to find the number of significant PCs
+sce <- runPCA(sce, ncomponents = 50, subset_row = top_hvgs)
+sce
+percent_var <- attr(reducedDim(sce, "PCA"), "percentVar")
+pca_elbow <- findElbowPoint(percent_var)
+pca_elbow
+ggplot(mapping = aes(x = seq_along(percent_var), y = percent_var)) +
+	geom_point() +
+	geom_vline(xintercept = pca_elbow, col = "blue") +
+	labs(
+		title = "Scree plot",
+		x = "PC",
+		y = "Variance explained (%)"
+	) +
+	theme_bw()
+reducedDim(sce, "PCA") <- reducedDim(sce, "PCA")[, 1:pca_elbow, drop = FALSE]
+ncol(reducedDim(sce, "PCA"))
+# Solution 2: run the PCA and remove PCs corresponding to technical noise
+sce <- denoisePCA(sce, dec, subset.row = top_hvgs, min.rank = 5, max.rank = 50)
+ncol(reducedDim(sce, "PCA"))
+```
+
+# Dimensionality reduction by UMAP
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Run UMAP
+sce <- runUMAP(sce, dimred = "PCA")
+# UMAP plot colored by cell type
+dittoDimPlot(sce, "label", reduction.use = "UMAP", size = 0.5,
+             main = "UMAP plot colored by cell type", legend.show = FALSE,
+             do.label = TRUE, labels.highlight = FALSE, labels.size = 4)
+```
+
+# Marker gene detection
+
+## Detecting marker genes
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+markers <- findMarkers(sce, groups = sce$label, test.type = "t",
+                       pval.type = "all", direction = "up", lfc = 1)
+markers
+head(markers[["alpha"]])
+```
+
+## Top marker for each cell type
+
+```{r, message = FALSE, warning = FALSE}
+top_markers <- lapply(markers, function(x) rownames(x)[1]) %>%
+	unlist() %>%
+	enframe()
+top_markers
+```
+
+## Top marker gene tables {.tabset}
+
+```{r, message = FALSE, warning = FALSE, results = 'asis'}
+for (cell_type in levels(sce$label)) {
+	cat("\n\n###", cell_type, "\n")
+	markers[[cell_type]] %>%
+		as.data.frame() %>%
+		head(n = 5) %>%
+		t() %>%
+		kable() %>%
+		print()
+}
+```
+
+## Top marker gene expression plots {.tabset}
+
+```{r, message = FALSE, warning = FALSE, results = 'asis'}
+top_markers <- lapply(markers, function(x) rownames(x)[1])
+for (cell_type in levels(sce$label)) {
+	cat("\n\n###", cell_type, "\n")
+	expression_plot <- dittoDimPlot(sce, top_markers[[cell_type]], reduction.use = "UMAP",
+	                                size = 0.5, order = "increasing")
+	print(expression_plot)
+}
+```
+
+## Top marker gene density plots {.tabset}
+
+```{r, message = FALSE, warning = FALSE, results = 'asis'}
+top_markers <- lapply(markers, function(x) rownames(x)[1])
+for (cell_type in levels(sce$label)) {
+	cat("\n\n###", cell_type, "\n")
+	density_plot <- plot_density(sce, top_markers[[cell_type]], size = 0.5)
+	print(density_plot)
+}
+```
+
+## Top marker gene violin plots {.tabset}
+
+```{r, message = FALSE, warning = FALSE, results = 'asis'}
+top_markers <- lapply(markers, function(x) rownames(x)[1])
+for (cell_type in levels(sce$label)) {
+	cat("\n\n###", cell_type, "\n")
+	violin_plot <- dittoPlot(sce, top_markers[[cell_type]], group.by = "label",
+	                         plots = c("vlnplot"), vlnplot.lineweight = 0.5,
+	                         legend.show = FALSE)
+	print(violin_plot)
+}
+```
+
+## Top marker gene ridge plots {.tabset}
+
+```{r, message = FALSE, warning = FALSE, results = 'asis'}
+top_markers <- lapply(markers, function(x) rownames(x)[1])
+for (cell_type in levels(sce$label)) {
+	cat("\n\n###", cell_type, "\n")
+	ridge_plot <- dittoPlot(sce, top_markers[[cell_type]], group.by = "label",
+	                        plots = c("ridgeplot"), ridgeplot.lineweight = 0.5,
+	                        legend.show = FALSE)
+	print(ridge_plot)
+}
+```
+
+## Top marker gene heatmaps
+
+```{r, message = FALSE, warning = FALSE}
+top_markers <- sapply(markers, function(x) rownames(x)[1])
+# Average gene expression heatmap
+plotGroupedHeatmap(sce, top_markers, group = "label", color = viridis(100),
+                   cluster_rows = FALSE, cluster_cols = FALSE)
+# Gene expression heatmap
+dittoHeatmap(sce, top_markers, annot.by = "label", cluster_rows = TRUE)
+```
+
+# Marker gene detection (binomial test)
+
+## Detecting marker genes
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+markers_binom <- findMarkers(sce, groups = sce$label, test.type = "binom",
+                             pval.type = "all", direction = "up", lfc = 1)
+markers_binom
+head(markers_binom[["alpha"]])
+```
+
+## Top marker for each cell type
+
+```{r, message = FALSE, warning = FALSE}
+top_markers_binom <- lapply(markers_binom, function(x) rownames(x)[1]) %>%
+	unlist() %>%
+	enframe()
+top_markers_binom
+```
+
+## Top marker gene tables {.tabset}
+
+```{r, message = FALSE, warning = FALSE, results = 'asis'}
+for (cell_type in levels(sce$label)) {
+	cat("\n\n###", cell_type, "\n")
+	markers_binom[[cell_type]] %>%
+		as.data.frame() %>%
+		head(n = 5) %>%
+		t() %>%
+		kable() %>%
+		print()
+}
+```
+
+## Top marker gene dot plot
+
+```{r, message = FALSE, warning = FALSE}
+top_markers_binom <- sapply(markers_binom, function(x) rownames(x)[1])
+dittoDotPlot(sce, top_markers_binom, group.by = "label")
+```
+
+## Top marker gene heatmap
+
+```{r, message = FALSE, warning = FALSE}
+top_markers_binom <- sapply(markers_binom, function(x) rownames(x)[1])
+dittoHeatmap(sce, top_markers_binom, annot.by = "label",
+             scaled.to.max = TRUE, cluster_rows = FALSE)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
