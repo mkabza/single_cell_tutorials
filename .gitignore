@@ -43,3 +43,6 @@ rmarkdown/*_files/
 
 # R Environment Variables
 .Renviron
+
+# h5ad-formatted hdf5 files
+*.h5ad
