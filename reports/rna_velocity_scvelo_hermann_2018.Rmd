@@ -1,0 +1,318 @@
+---
+title: "RNA velocity analysis and cell fate mapping using scVelo and Cellrank"
+subtitle: "Data: mouse spermatogenic cells (Hermann et al. 2018)"
+author: "Michał Kabza"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: default
+    highlight: pygments
+    df_print: kable
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+# Preparing the environment
+
+Load the required packages:
+```{r, message = FALSE}
+library(tidyverse)
+library(glue)
+library(knitr)
+library(Matrix)
+library(scRNAseq)
+library(scater)
+library(scran)
+library(dittoSeq)
+library(reticulate)
+library(zellkonverter)
+```
+
+Create a conda environment containing the required Python packages:
+```{r, eval = FALSE}
+if (!file.exists(miniconda_path())) {
+	install_miniconda()
+}
+conda_install("r-cellrank", c("cellrank-krylov", "python-igraph"),
+              python_version = "3.8", channel = c("conda-forge", "bioconda"))
+```
+
+Miniconda installation path:
+```{r, message = FALSE, warning = FALSE}
+miniconda_path()
+```
+
+List the available conda environments:
+```{r, message = FALSE, warning = FALSE}
+conda_list()
+```
+
+Use the created conda environment:
+```{r, message = FALSE, warning = FALSE}
+use_condaenv("r-cellrank", required = TRUE)
+```
+
+# Preparing the data
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Load the Hermann et al. (2018) mouse spermatogenic cells dataset
+sce <- HermannSpermatogenesisData()
+sce
+# Fix row names
+rownames(sce) <- str_remove(rownames(sce), ".\\d+$")
+# Cell metadata
+colData(sce)
+# Cell type summary
+sce$celltype %>%
+  fct_explicit_na(na_level = "NA") %>%
+	table() %>%
+	enframe() %>%
+	arrange(desc(value))
+# Prepare the cell type labels
+sce$cell_type <- sce$celltype %>%
+  fct_explicit_na(na_level = "Other") %>%
+  str_remove(" spermatids") %>%
+	fct_lump_min(min = 400, other_level = "Other") %>%
+	fct_relevel("Early Round", "Mid Round", "Late Round", "Other") %>%
+	fct_drop()
+table(sce$cell_type)
+```
+
+# Basic analysis
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, cache.lazy = FALSE}
+# Set the RNG seed for reproducible results
+set.seed(42)
+# Data normalization
+quick_clusters <- quickCluster(sce, assay.type = "spliced")
+table(quick_clusters)
+sce <- computeSumFactors(sce, clusters = quick_clusters, assay.type = "spliced")
+sce <- logNormCounts(sce, assay.type = "spliced")
+# Selecting highly variable genes
+dec <- modelGeneVar(sce)
+top_hvgs <- getTopHVGs(dec, fdr.threshold = 0.05)
+length(top_hvgs)
+# Principal component analysis
+sce <- denoisePCA(sce, dec, subset.row = top_hvgs, min.rank = 5, max.rank = 50)
+ncol(reducedDim(sce, "PCA"))
+# Dimensionality reduction by UMAP
+sce <- runUMAP(sce, dimred = "PCA")
+```
+
+# UMAP plots
+
+```{r, message = FALSE, warning = FALSE}
+dittoDimPlot(sce, "cell_type", reduction.use = "UMAP", size = 0.5,
+             legend.show = FALSE, do.label = TRUE,
+             labels.highlight = FALSE, labels.size = 4)
+dittoDimPlot(sce, "cell_type", reduction.use = "UMAP", size = 0.1,
+             split.by = "cell_type", split.ncol = 2, legend.show = FALSE)
+```
+
+# Preparing the anndata object
+
+```{r, message = FALSE, warning = FALSE}
+sce_adata <- SingleCellExperiment(
+  assays = list(
+    counts = assay(sce, "spliced"),
+    spliced = assay(sce, "spliced"),
+    unspliced = assay(sce, "unspliced")
+  ),
+  colData = DataFrame(
+    cell_type = sce$cell_type
+  ),
+  reducedDims = list(
+    X_umap = reducedDim(sce, "UMAP")
+  )
+)
+sce
+adata <- SCE2AnnData(sce_adata)
+adata
+```
+
+# RNA velocity analysis using scVelo
+
+## Preparing the data
+
+Load the required Python modules:
+```{python}
+import scanpy as sc
+import scvelo as scv
+import cellrank as cr
+import matplotlib.pyplot as plt
+scv.settings.verbosity = 0
+cr.settings.verbosity = 0
+```
+
+Get the anndata object:
+```{python}
+adata = r.adata
+```
+
+Pie chart of spliced/unspliced proportions:
+```{python}
+scv.pl.proportions(adata, groupby='cell_type')
+```
+
+Preprocess the data:
+```{python}
+scv.pp.filter_and_normalize(adata, n_top_genes=2000, enforce=True)
+scv.pp.moments(adata, n_pcs=30, n_neighbors=30)
+```
+
+## RNA velocity
+
+RNA velocity analysis using the dynamical model:
+```{python, results = 'hide'}
+scv.tl.recover_dynamics(adata, n_jobs = 4)
+scv.tl.velocity(adata, mode='dynamical')
+scv.tl.velocity_graph(adata)
+```
+
+Stream plot of velocities on the UMAP embedding:
+```{python}
+scv.pl.velocity_embedding_stream(adata, basis='umap', color='cell_type')
+```
+
+## Speed and coherence
+
+```{python}
+scv.tl.velocity_confidence(adata)
+scv.pl.scatter(adata, basis='umap', color='velocity_length',
+               cmap='coolwarm', perc=[5, 95])
+scv.pl.scatter(adata, basis='umap', color='velocity_confidence',
+               cmap='coolwarm', perc=[5, 95])
+```
+
+## Velocity graph and pseudotime
+
+```{python}
+scv.tl.velocity_pseudotime(adata)
+scv.pl.velocity_graph(adata, basis='umap', color='cell_type', threshold=0.1,
+                      legend_loc='best')
+scv.pl.scatter(adata, basis='umap', color='velocity_pseudotime',
+               cmap='gnuplot')
+```
+
+## PAGA velocity graph
+
+```{python}
+scv.tl.paga(adata, groups='cell_type')
+scv.pl.paga(adata, basis='umap', size=50, alpha=0.1, min_edge_width=2,
+            node_size_scale=1.5, legend_loc='best')
+```
+
+## Differential velocity analysis
+
+```{python}
+scv.tl.rank_velocity_genes(adata, groupby='cell_type', min_corr=0.3)
+diff_velo_df = scv.DataFrame(adata.uns['rank_velocity_genes']['names'])
+```
+
+```{r}
+head(py$diff_velo_df)
+```
+
+```{python}
+scv.pl.velocity(adata, diff_velo_df.iloc[0, :], color='cell_type', ncols = 1)
+```
+
+## Inspecting the anndata object
+
+```{python}
+adata
+```
+
+# Cell fate mapping using Cellrank
+
+## Data processing using VelocityKernel
+
+Calculating the transition matrix:
+```{python, results = 'hide'}
+vtk = cr.tl.kernels.VelocityKernel(adata)
+vtk.compute_transition_matrix()
+```
+
+Plot the UMAP projection of the transition matrix:
+```{python}
+vtk.compute_projection(basis='umap')
+scv.pl.velocity_embedding_stream(adata, basis='umap', color='cell_type',
+                                 vkey='T_fwd')
+```
+
+## Macrostate analysis
+
+Computing Schur decomposition:
+```{python, results = 'hide'}
+gpcaa = cr.tl.estimators.GPCCA(vtk)
+gpcaa.compute_schur(n_components=10)
+```
+
+Top eigenvalues plot:
+```{python}
+gpcaa.plot_spectrum(real_only=True)
+plt.show()
+```
+
+Computing macrostates:
+```{python}
+gpcaa.compute_macrostates(n_states=2, cluster_key='cell_type')
+gpcaa.plot_macrostates()
+```
+
+Computing terminal states:
+```{python}
+gpcaa.compute_terminal_states()
+gpcaa.plot_terminal_states()
+```
+
+## Absorption probabilities
+
+Calculating absorption probabilities:
+```{python, results = 'hide'}
+gpcaa.compute_absorption_probabilities()
+```
+
+Plot the absorption probabilities:
+```{python}
+gpcaa.plot_absorption_probabilities(legend_loc='best')
+gpcaa.plot_absorption_probabilities(same_plot=False, ncols=1)
+```
+
+## Inspecting the anndata object
+
+```{python}
+adata
+```
+
+## Saving the anndata object
+
+```{python}
+adata.uns['terminal_states_names'] = adata.obsm['to_terminal_states'].names
+del adata.uns['coarse_fwd']
+adata.write('rna_velocity_scvelo_hermann_2018.h5ad', compression='gzip')
+```
+
+# Getting back to R
+
+Read the h5ad file:
+```{r, message = FALSE, warning = FALSE}
+sce_cellrank <- readH5AD("rna_velocity_scvelo_hermann_2018.h5ad")
+sce_cellrank
+```
+
+Get terminal state absorption probabilities for each cell:
+```{r, message = FALSE, warning = FALSE}
+absorption_probabilities <- setNames(
+  as.data.frame(reducedDim(sce_cellrank, "to_terminal_states")),
+  metadata(sce_cellrank)$terminal_states_names
+)
+head(absorption_probabilities)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
